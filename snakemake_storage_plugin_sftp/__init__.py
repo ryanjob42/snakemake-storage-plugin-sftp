@@ -3,7 +3,7 @@ from pathlib import PosixPath
 from typing import Any, Iterable, List, Optional
 from urllib.parse import urlparse
 
-import pysftp
+import sftpretty
 
 from snakemake_interface_storage_plugins.settings import StorageProviderSettingsBase
 from snakemake_interface_storage_plugins.storage_provider import (
@@ -23,9 +23,6 @@ from snakemake_interface_storage_plugins.io import (
     IOCacheStorageInterface,
     get_constant_prefix,
 )
-
-from snakemake_storage_plugin_sftp.cnopts import CnOpts
-
 
 # Optional:
 # Define settings for your storage plugin (e.g. host url, credentials).
@@ -60,6 +57,40 @@ class StorageProviderSettings(StorageProviderSettingsBase):
         default=None,
         metadata={
             "help": "SFTP password",
+            # Optionally request that setting is also available for specification
+            # via an environment variable. The variable will be named automatically as
+            # SNAKEMAKE_<storage-plugin-name>_<param-name>, all upper case.
+            # This mechanism should only be used for passwords, usernames, and other
+            # credentials.
+            # For other items, we rather recommend to let people use a profile
+            # for setting defaults
+            # (https://snakemake.readthedocs.io/en/stable/executing/cli.html#profiles).
+            "env_var": True,
+            # Optionally specify that setting is required when the executor is in use.
+            "required": False,
+        },
+    )
+    private_key: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "SFTP private key file path",
+            # Optionally request that setting is also available for specification
+            # via an environment variable. The variable will be named automatically as
+            # SNAKEMAKE_<storage-plugin-name>_<param-name>, all upper case.
+            # This mechanism should only be used for passwords, usernames, and other
+            # credentials.
+            # For other items, we rather recommend to let people use a profile
+            # for setting defaults
+            # (https://snakemake.readthedocs.io/en/stable/executing/cli.html#profiles).
+            "env_var": True,
+            # Optionally specify that setting is required when the executor is in use.
+            "required": False,
+        },
+    )
+    private_key_pass: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "SFTP private key file password",
             # Optionally request that setting is also available for specification
             # via an environment variable. The variable will be named automatically as
             # SNAKEMAKE_<storage-plugin-name>_<param-name>, all upper case.
@@ -156,12 +187,13 @@ class StorageProvider(StorageProviderBase):
     def get_conn(self, hostname: str, port: Optional[int] = 22):
         key = hostname, port
         if key not in self.conn_pool:
-            conn = pysftp.Connection(
-                hostname,
-                port=port,
-                cnopts=CnOpts(port=port),
+            conn = sftpretty.Connection(
+                host=hostname,
+                port=port if port is not None else 22,
                 username=self.settings.username,
                 password=self.settings.password,
+                private_key=self.settings.private_key,
+                private_key_pass=self.settings.private_key_pass,
             )
             self.conn_pool[key] = conn
             return conn
@@ -253,7 +285,7 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         put = self.conn.put_r if self.local_path().is_dir() else self.conn.put
         parents = str(PosixPath(self.parsed_query.path).parent)
         if parents != ".":
-            self.conn.makedirs(parents)
+            self.conn.mkdir_p(parents)
         put(
             self.local_path(),
             self.parsed_query.path,
@@ -280,19 +312,22 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         # This is used by glob_wildcards() to find matches for wildcards in the query.
         # The method has to return concretized queries without any remaining wildcards.
         prefix = get_constant_prefix(self.query, strip_incomplete_parts=True)
+
+        # Search the entire directory tree for files and empty directories
+        # starting with the prefix (which may be a file, directory, or might not exist).
         items = []
-        if self.conn.isdir(prefix):
-            prefix = PosixPath(prefix)
+        visit_queue = [prefix]
+        while visit_queue:
+            current = visit_queue.pop()
+            if self.conn.isfile(current):
+                items.append(current)
+            elif self.conn.isdir(current):
+                # Keep searching non-empty directories, but yield empty ones.
+                contents = self.conn.listdir(current)
+                if contents:
+                    current = PosixPath(current)
+                    visit_queue.extend([str(current / child) for child in contents])
+                else:
+                    items.append(current)
 
-            def yieldfile(path):
-                items.append(str(prefix / path))
-
-            def yielddir(path):
-                # only yield directories that are empty
-                if not self.conn.listdir(str(prefix / path)):
-                    items.append(str(prefix / path))
-
-            self.conn.walktree(prefix, fcallback=yieldfile, dcallback=yielddir)
-        elif self.conn.exists(prefix):
-            items.append(prefix)
         return items
